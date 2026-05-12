@@ -1127,23 +1127,13 @@ class EAPHunter:
 
     def _record_identity(self, identity: str):
         self.identities.append(identity)
-        # Always write full identity string
         self._append_unique(self.out_dir / "eap_identities.txt", identity)
         if "@" in identity:
             user, domain = identity.rsplit("@", 1)
             info(f"  Username : {user}"); info(f"  Domain   : {domain}")
-            self._append_unique(self.out_dir / "usernames.txt", user)
-            self._append_unique(self.out_dir / "domains.txt",   domain)
-            self._append_unique(self.out_dir / "credentials.txt", identity)
         elif "\\" in identity:
             domain, user = identity.split("\\", 1)
             info(f"  Domain   : {domain}"); info(f"  Username : {user}")
-            self._append_unique(self.out_dir / "domains.txt",     domain)
-            self._append_unique(self.out_dir / "usernames.txt",   user)
-            self._append_unique(self.out_dir / "credentials.txt", identity)
-        else:
-            # Bare username with no domain separator
-            self._append_unique(self.out_dir / "credentials.txt", identity)
 
     def _pcap_identities(self, pcap_file: str):
         if not pcap_file or not Path(pcap_file).exists():
