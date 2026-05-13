@@ -1,7 +1,7 @@
 # EAPHunter
 
-Two modes for WPA-Enterprise targets: harvest EAP outer identities and RADIUS
-certificates via deauth, or spray credentials directly against the AP.
+Three modes for WPA-Enterprise targets: harvest EAP outer identities via deauth,
+spray credentials against the AP, or continuously deauthenticate clients.
 
 ## Requirements
 
@@ -9,7 +9,7 @@ certificates via deauth, or spray credentials directly against the AP.
 pip install scapy cryptography
 ```
 
-`wpa_supplicant` required for spray mode. `iw` and `ip` required for both.
+`wpa_supplicant` required for spray mode. `iw` and `ip` required for all modes.
 
 ## userenum
 
@@ -66,9 +66,6 @@ sudo python3 eaphunter.py spray -e <SSID> -i <interface> \
 ```
 
 ```
-  --------------------------------------------------------------
-  Password Spray  —  HTB-Corp  (90 attempts)
-  --------------------------------------------------------------
   [001/090]  jsmith                        Winter2024!   ->  failed
   [002/090]  jdoe                          Winter2024!   ->  failed
   [003/090]  HTB\administrator             Winter2024!   ->  VALID  <---
@@ -76,3 +73,18 @@ sudo python3 eaphunter.py spray -e <SSID> -i <interface> \
 ```
 
 Output: `spray_hits.txt`
+
+---
+
+## deauth
+
+Continuously monitors clients on a target AP and sends deauth frames on demand.
+No EAP capture — purely for disruption or to trigger reconnects for other tools.
+
+```
+sudo python3 eaphunter.py deauth -e <SSID> -i <interface>
+sudo python3 eaphunter.py deauth --bssid <BSSID> -c <channel> -i <interface>
+```
+
+Same client table and selection dialogue as userenum. `auto` deauths all observed
+clients in random order. `q` to quit.
