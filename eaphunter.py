@@ -976,7 +976,7 @@ class EAPHunter:
                 if identity and identity not in seen_ids:
                     seen_ids.add(identity)
                     print(f"\r  [+] EAP Identity  : {identity}          ")
-                    self._record_identity(identity)
+                    self._record_identity(identity, target_mac)
             elif eap.code == 1 and eap.type not in (0, 1):
                 name = EAP_METHODS.get(eap.type, f"type {eap.type}")
                 if name not in seen_methods:
@@ -1022,9 +1022,12 @@ class EAPHunter:
 
     # ── Identity helpers ─────────────────────────────────────────────────────
 
-    def _record_identity(self, identity: str):
+    def _record_identity(self, identity: str, mac: str = ""):
         self.identities.append(identity)
-        self._append_unique(self.out_dir / "eap_identities.txt", identity)
+        line = f"{identity}\t{mac}" if mac else identity
+        self._append_unique(self.out_dir / "eap_identities.txt", line)
+        if mac:
+            info(f"  MAC      : {mac}")
         if "@" in identity:
             user, domain = identity.rsplit("@", 1)
             info(f"  Username : {user}"); info(f"  Domain   : {domain}")
@@ -1048,8 +1051,14 @@ class EAPHunter:
                 continue
             if identity and identity not in self.identities:
                 found = True
-                ok(f"EAP Identity : {identity}")
-                self._record_identity(identity)
+                mac = ""
+                try:
+                    if pkt.haslayer(_sc.Dot11):
+                        mac = pkt[_sc.Dot11].addr2 or ""
+                except Exception:
+                    pass
+                ok(f"EAP Identity : {identity}" + (f"  ({mac})" if mac else ""))
+                self._record_identity(identity, mac)
         if not found:
             warn("No EAP identities found in capture.")
 
@@ -1075,6 +1084,309 @@ def _sorted_clients(table: dict) -> list[dict]:
     # Never re-order existing entries so a queued number always hits the right client.
     return sorted(table.values(), key=lambda c: c["first_seen"])
 
+
+
+# ── EAP auth-method descriptors ──────────────────────────────────────────────
+# Each tuple: (display_name, wpa_supplicant_spec_dict)
+# Spec keys:
+#   eap          – EAP type string passed to wpa_supplicant
+#   phase1       – optional phase1 string
+#   phase2       – optional phase2 string
+#   use_cert     – outer TLS client cert (EAP-TLS)
+#   use_cert2    – inner TLS client cert (PEAP/TLS, TTLS/EAP-TLS)
+#   use_password – False to omit password line (default True)
+#   pac_file     – True to add EAP-FAST PAC file line
+#   cleartext    – True when inner auth delivers plaintext credentials to the
+#                  server (PAP, GTC, OTP) — interceptable verbatim via evil twin
+_AUTH_METHODS: list[tuple[str, dict]] = [
+    ("EAP-TLS",                    dict(eap="TLS",  use_cert=True, use_password=False)),
+    ("EAP-PEAP/MSCHAPv2",          dict(eap="PEAP", phase1="peaplabel=0", phase2="auth=MSCHAPV2")),
+    ("EAP-PEAP/TLS",               dict(eap="PEAP", phase1="peaplabel=0", phase2="auth=TLS",
+                                        use_cert2=True, use_password=False)),
+    ("EAP-PEAP/GTC",               dict(eap="PEAP", phase1="peaplabel=0", phase2="auth=GTC",
+                                        cleartext=True)),
+    ("EAP-PEAP/OTP",               dict(eap="PEAP", phase1="peaplabel=0", phase2="auth=OTP",
+                                        cleartext=True)),
+    ("EAP-PEAP/MD5-Challenge",     dict(eap="PEAP", phase1="peaplabel=0", phase2="auth=MD5")),
+    ("EAP-TTLS/EAP-MD5-Challenge", dict(eap="TTLS", phase2="autheap=MD5")),
+    ("EAP-TTLS/EAP-GTC",           dict(eap="TTLS", phase2="autheap=GTC", cleartext=True)),
+    ("EAP-TTLS/EAP-OTP",           dict(eap="TTLS", phase2="autheap=OTP", cleartext=True)),
+    ("EAP-TTLS/EAP-MSCHAPv2",      dict(eap="TTLS", phase2="autheap=MSCHAPV2")),
+    ("EAP-TTLS/EAP-TLS",           dict(eap="TTLS", phase2="autheap=TLS",
+                                        use_cert2=True, use_password=False)),
+    ("EAP-TTLS/MSCHAPv2",          dict(eap="TTLS", phase2="auth=MSCHAPV2")),
+    ("EAP-TTLS/MSCHAP",            dict(eap="TTLS", phase2="auth=MSCHAP")),
+    ("EAP-TTLS/PAP",               dict(eap="TTLS", phase2="auth=PAP",    cleartext=True)),
+    ("EAP-TTLS/CHAP",              dict(eap="TTLS", phase2="auth=CHAP")),
+    ("EAP-FAST/MSCHAPv2",          dict(eap="FAST", phase1="fast_provisioning=3",
+                                        phase2="auth=MSCHAPV2", pac_file=True)),
+    ("EAP-FAST/GTC",               dict(eap="FAST", phase1="fast_provisioning=3",
+                                        phase2="auth=GTC",      pac_file=True, cleartext=True)),
+    ("EAP-FAST/OTP",               dict(eap="FAST", phase1="fast_provisioning=3",
+                                        phase2="auth=OTP",      pac_file=True, cleartext=True)),
+]
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class EAPAuthProber:
+    """
+    Probe which EAP auth methods a RADIUS server accepts for a given identity.
+    Reproduces EAP_buster logic: iterate methods, run wpa_supplicant in debug
+    mode, detect 'accept proposed method' vs rejection in output.
+    """
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    _CERT_PASSWD = "whatever"
+
+    def __init__(self, essid: str, identity: str, iface: str, out_dir: str,
+                 cleartext_only: bool = False):
+        self.essid          = essid
+        self.identity       = identity
+        self.iface          = iface
+        self.out_dir        = Path(out_dir)
+        self.cleartext_only = cleartext_only
+        self._tmp           = Path(tempfile.mkdtemp(prefix="eaphunter_authmethods_"))
+        self._orig_mac      = ""
+        self._cert_pem      = ""
+        self._cert_key      = ""
+
+    # ── Entry point ──────────────────────────────────────────────────────────
+
+    def run(self):
+        if not shutil.which("wpa_supplicant"):
+            die("wpa_supplicant not found")
+
+        methods = [(n, s) for n, s in _AUTH_METHODS
+                   if not self.cleartext_only or s.get("cleartext")]
+        needs_tls = any(s.get("use_cert") or s.get("use_cert2")
+                        for _, s in methods)
+
+        if needs_tls and not shutil.which("openssl"):
+            die("openssl not found — required for TLS-based method probing")
+
+        section(f"EAP Auth Method Probe  —  {self.essid}")
+        info(f"Identity  : {self.identity}")
+        info(f"Interface : {self.iface}")
+        if self.cleartext_only:
+            info("Mode      : cleartext methods only (PAP / GTC / OTP)")
+        warn("Use a real, captured EAP identity for reliable results.")
+
+        self._orig_mac = self._get_mac()
+        self._set_managed()
+        self._kill_wpa()
+
+        if needs_tls:
+            info("Generating self-signed certificate for TLS-based methods …")
+            self._gen_cert()
+            ok("Certificate ready.")
+        print()
+
+        supported: list[str] = []
+        not_supported: list[str] = []
+
+        try:
+            for name, spec in methods:
+                print(f"  [*] {name:<35} … ", end="", flush=True)
+                result = self._probe(spec)
+                if result:
+                    print("\033[0;32mSUPPORTED\033[0m")
+                    supported.append(name)
+                else:
+                    print("\033[0;31mnot supported\033[0m")
+                    not_supported.append(name)
+        finally:
+            self._restore_mac()
+            shutil.rmtree(self._tmp, ignore_errors=True)
+
+        section("Results")
+        if supported:
+            ok(f"{len(supported)} supported method(s):")
+            for m in supported:
+                print(f"    {m}")
+        else:
+            warn("No supported methods detected.")
+
+        safe_id = re.sub(r"[^\w@.-]", "_", self.identity)
+        out_file = self.out_dir / f"auth_methods_{safe_id}.txt"
+        with open(out_file, "w") as f:
+            f.write(f"# EAP Auth Methods — {self.essid} — {self.identity}\n")
+            f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write("# SUPPORTED\n")
+            for m in supported:
+                f.write(f"{m}\n")
+            f.write("\n# NOT SUPPORTED\n")
+            for m in not_supported:
+                f.write(f"{m}\n")
+        ok(f"Results saved: {out_file}")
+
+    # ── Single method probe ───────────────────────────────────────────────────
+
+    def _probe(self, spec: dict) -> bool:
+        stale = Path(f"/var/run/wpa_supplicant/{self.iface}")
+        stale.unlink(missing_ok=True)
+
+        config_path = self._tmp / "probe.conf"
+        config_path.write_text(self._make_config(spec))
+
+        self._randomize_mac()
+
+        proc = subprocess.Popen(
+            ["wpa_supplicant", "-d", "-K", "-D", "nl80211",
+             "-i", self.iface, "-c", str(config_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+
+        buf    = b""
+        deadline = time.time() + 16
+
+        try:
+            while time.time() < deadline:
+                remaining = deadline - time.time()
+                ready, _, _ = _select.select(
+                    [proc.stdout], [], [], min(remaining, 0.5)
+                )
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(proc.stdout.fileno(), 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                # Early exit on definitive failure
+                if (b"EAP: Status notification: failure" in buf or
+                        b"CTRL-EVENT-AUTH-FAILED"           in buf or
+                        b"CTRL-EVENT-SSID-TEMP-DISABLED"    in buf):
+                    break
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+        # EAP_buster detection logic
+        if b"EAP: Status notification: accept proposed method" not in buf:
+            return False
+        if b"TLS: Phase 2 Request: Nak" not in buf:
+            return True   # accepted, no phase2 Nak → supported as-is
+        return b"Selected Phase 2" in buf
+
+    # ── wpa_supplicant config builder ─────────────────────────────────────────
+
+    def _make_config(self, spec: dict) -> str:
+        lines = [
+            "ctrl_interface=/var/run/wpa_supplicant",
+            "eapol_version=1",
+            "ap_scan=1",
+            "fast_reauth=1",
+            "",
+            "network={",
+            "    scan_ssid=1",
+            f'    ssid="{self.essid}"',
+            "    key_mgmt=WPA-EAP",
+            f'    eap={spec["eap"]}',
+            f'    identity="{self.identity}"',
+        ]
+        if spec.get("use_password", True):
+            lines.append('    password="whatever"')
+        if spec.get("use_cert"):
+            lines += [
+                f'    client_cert="{self._cert_pem}"',
+                f'    private_key="{self._cert_key}"',
+                f'    private_key_passwd="{self._CERT_PASSWD}"',
+            ]
+        if spec.get("phase1"):
+            lines.append(f'    phase1="{spec["phase1"]}"')
+        if spec.get("pac_file"):
+            lines.append(f'    pac_file="{self._tmp / "eap-fast.pac"}"')
+        if spec.get("phase2"):
+            lines.append(f'    phase2="{spec["phase2"]}"')
+        if spec.get("use_cert2"):
+            lines += [
+                f'    client_cert2="{self._cert_pem}"',
+                f'    private_key2="{self._cert_key}"',
+                f'    private_key2_passwd="{self._CERT_PASSWD}"',
+            ]
+        lines.append("}")
+        return "\n".join(lines) + "\n"
+
+    # ── Certificate generation ────────────────────────────────────────────────
+
+    def _gen_cert(self):
+        self._cert_pem = str(self._tmp / "user.pem")
+        self._cert_key = str(self._tmp / "user.key")
+        subj = (f"/CN={self.identity.replace('/', '_')}"
+                f"/O={self.essid.replace('/', '_')}")
+        r = subprocess.run([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", self._cert_key,
+            "-out",    self._cert_pem,
+            "-days",   "365",
+            "-passout", f"pass:{self._CERT_PASSWD}",
+            "-subj",   subj,
+        ], capture_output=True)
+        if r.returncode != 0:
+            die(f"openssl failed: {r.stderr.decode(errors='replace').strip()}")
+
+    # ── MAC helpers ───────────────────────────────────────────────────────────
+
+    def _get_mac(self) -> str:
+        try:
+            r = subprocess.run(["ip", "link", "show", self.iface],
+                               capture_output=True, text=True)
+            m = re.search(r"link/ether ([0-9a-f:]{17})", r.stdout)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        return ""
+
+    def _randomize_mac(self):
+        import random
+        mac = [random.randint(0, 255) for _ in range(6)]
+        mac[0] = (mac[0] & 0xFE) | 0x02   # locally administered, unicast
+        mac_str = ":".join(f"{b:02x}" for b in mac)
+        for cmd in (
+            ["ip", "link", "set", self.iface, "down"],
+            ["ip", "link", "set", self.iface, "address", mac_str],
+            ["ip", "link", "set", self.iface, "up"],
+        ):
+            subprocess.run(cmd, capture_output=True)
+
+    def _restore_mac(self):
+        if not self._orig_mac:
+            return
+        for cmd in (
+            ["ip", "link", "set", self.iface, "down"],
+            ["ip", "link", "set", self.iface, "address", self._orig_mac],
+            ["ip", "link", "set", self.iface, "up"],
+        ):
+            subprocess.run(cmd, capture_output=True)
+
+    # ── Interface helpers ────────────────────────────────────────────────────
+
+    def _set_managed(self):
+        for cmd in (
+            ["ip",  "link", "set", self.iface, "down"],
+            ["iw",  "dev",  self.iface, "set", "type", "managed"],
+            ["ip",  "link", "set", self.iface, "up"],
+        ):
+            subprocess.run(cmd, capture_output=True)
+
+    @staticmethod
+    def _kill_wpa():
+        for pid_dir in Path("/proc").iterdir():
+            if not pid_dir.name.isdigit():
+                continue
+            try:
+                comm = (pid_dir / "comm").read_text().strip()
+                if comm == "wpa_supplicant":
+                    os.kill(int(pid_dir.name), signal.SIGTERM)
+            except Exception:
+                pass
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1568,6 +1880,19 @@ def main():
                     help="Seconds between attempts (default: 0)")
     sp.add_argument("-o", "--output",    default=None, help="Output directory")
 
+    # ── authmethods ───────────────────────────────────────────────────────────
+    am = sub.add_parser("authmethods",
+                        help="Probe which EAP auth methods the RADIUS server supports")
+    am.add_argument("-e", "--essid",     required=True, help="Target SSID")
+    am.add_argument("-i", "--interface", required=True, help="Wireless interface")
+    am.add_argument("-I", "--identity",  default=None,
+                    help="Single EAP identity to probe with")
+    am.add_argument("--identityfile",    default=None,
+                    help="File of EAP identities (probed in order)")
+    am.add_argument("--cleartext",       action="store_true",
+                    help="Only test cleartext (non-TLS) auth methods")
+    am.add_argument("-o", "--output",    default=None, help="Output directory")
+
     # ── deauth ────────────────────────────────────────────────────────────────
     da = sub.add_parser("deauth",
                         help="Monitor clients and deauthenticate on demand")
@@ -1621,6 +1946,25 @@ def main():
         signal.signal(signal.SIGINT,  lambda _s, _f: sys.exit(0))
         signal.signal(signal.SIGTERM, lambda _s, _f: sys.exit(0))
         sprayer.run()
+
+    elif args.mode == "authmethods":
+        identities: list[str] = []
+        if args.identity:
+            identities.append(args.identity)
+        if args.identityfile:
+            identities.extend(_load_lines(args.identityfile))
+        if not identities:
+            die("Provide at least one identity: -I or --identityfile")
+
+        signal.signal(signal.SIGINT,  lambda _s, _f: sys.exit(0))
+        signal.signal(signal.SIGTERM, lambda _s, _f: sys.exit(0))
+        for identity in identities:
+            prober = EAPAuthProber(
+                essid=args.essid, identity=identity,
+                iface=args.interface, out_dir=out_dir,
+                cleartext_only=args.cleartext,
+            )
+            prober.run()
 
     elif args.mode == "deauth":
         if not args.essid and not args.bssid:
