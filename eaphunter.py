@@ -725,11 +725,19 @@ class EAPHunter:
             except Exception:
                 return
             if essid == self.essid:
+                rssi = "?"
+                try:
+                    rt = pkt.getlayer(_sc.RadioTap)
+                    if rt and hasattr(rt, "dBm_AntSignal"):
+                        rssi = str(rt.dBm_AntSignal)
+                except Exception:
+                    pass
                 with candidates_lock:
                     if bssid.lower() not in candidates:
                         candidates[bssid.lower()] = {
                             "bssid":   bssid,
                             "channel": ds_ch or current["ch"],
+                            "power":   rssi,
                         }
 
         hop = threading.Thread(target=self._hop_channels, args=(stop_hop, current), daemon=True)
@@ -747,7 +755,7 @@ class EAPHunter:
         else:
             print(f"\n  Found {len(entries)} BSS for '{self.essid}':\n")
             for i, e in enumerate(entries, 1):
-                print(f"    [{i}]  {e['bssid']}  (ch {e['channel']})")
+                print(f"    [{i}]  {e['bssid']}  ch {e['channel']:>3}  {e['power']:>4} dBm")
             print()
             while True:
                 sys.stdout.write("  Select BSSID [1]: ")
@@ -1651,11 +1659,19 @@ class Deauther:
             except Exception:
                 return
             if essid == self.essid:
+                rssi = "?"
+                try:
+                    rt = pkt.getlayer(_sc.RadioTap)
+                    if rt and hasattr(rt, "dBm_AntSignal"):
+                        rssi = str(rt.dBm_AntSignal)
+                except Exception:
+                    pass
                 with candidates_lock:
                     if bssid.lower() not in candidates:
                         candidates[bssid.lower()] = {
                             "bssid":   bssid,
                             "channel": ds_ch or current["ch"],
+                            "power":   rssi,
                         }
 
         hop = threading.Thread(target=self._hop_channels, args=(stop_hop, current),
@@ -1674,7 +1690,7 @@ class Deauther:
         else:
             print(f"\n  Found {len(entries)} BSS for '{self.essid}':\n")
             for i, e in enumerate(entries, 1):
-                print(f"    [{i}]  {e['bssid']}  (ch {e['channel']})")
+                print(f"    [{i}]  {e['bssid']}  ch {e['channel']:>3}  {e['power']:>4} dBm")
             print()
             while True:
                 sys.stdout.write("  Select BSSID [1]: ")
