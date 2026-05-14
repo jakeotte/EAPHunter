@@ -607,11 +607,13 @@ def _vendor(mac: str) -> str:
 class EAPHunter:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    def __init__(self, essid: str, iface: str, out_dir: str, capture_time: int):
+    def __init__(self, essid: str, iface: str, out_dir: str, capture_time: int,
+                 scan_time: int = 15):
         self.essid        = essid
         self.iface        = iface
         self.out_dir      = Path(out_dir)
-        self.capture_time = capture_time   # seconds for deauth+capture phase
+        self.capture_time = capture_time
+        self.scan_time    = scan_time
 
         self.bssid   = ""
         self.channel = 0
@@ -732,8 +734,8 @@ class EAPHunter:
 
         hop = threading.Thread(target=self._hop_channels, args=(stop_hop, current), daemon=True)
         hop.start()
-        info(f"Scanning for '{self.essid}' (15s) …")
-        _sc.sniff(iface=self.iface, prn=handle, timeout=15, store=False)
+        info(f"Scanning for '{self.essid}' ({self.scan_time}s) …")
+        _sc.sniff(iface=self.iface, prn=handle, timeout=self.scan_time, store=False)
         stop_hop.set()
 
         if not candidates:
@@ -1560,11 +1562,12 @@ class Deauther:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     def __init__(self, essid: str | None, bssid: str | None,
-                 channel: int | None, iface: str):
-        self.essid    = essid
-        self.bssid    = bssid or ""
-        self.channel  = channel or 0
-        self.iface    = iface
+                 channel: int | None, iface: str, scan_time: int = 15):
+        self.essid     = essid
+        self.bssid     = bssid or ""
+        self.channel   = channel or 0
+        self.iface     = iface
+        self.scan_time = scan_time
         self._client_table: dict[str, dict] = {}
         self._client_lock   = threading.Lock()
 
@@ -1658,8 +1661,8 @@ class Deauther:
         hop = threading.Thread(target=self._hop_channels, args=(stop_hop, current),
                                daemon=True)
         hop.start()
-        info(f"Scanning for '{self.essid}' (15s) …")
-        _sc.sniff(iface=self.iface, prn=handle, timeout=15, store=False)
+        info(f"Scanning for '{self.essid}' ({self.scan_time}s) …")
+        _sc.sniff(iface=self.iface, prn=handle, timeout=self.scan_time, store=False)
         stop_hop.set()
 
         if not candidates:
@@ -1865,6 +1868,8 @@ def main():
     ue.add_argument("-i", "--interface", required=True, help="Wireless interface")
     ue.add_argument("-c", "--capture",   type=int, default=20,
                     help="Capture window in seconds after deauth (default: 20)")
+    ue.add_argument("-s", "--scan-time", type=int, default=15, dest="scan_time",
+                    help="Seconds to scan for the AP's BSSID (default: 15)")
     ue.add_argument("-o", "--output",    default=None, help="Output directory")
 
     # ── spray ─────────────────────────────────────────────────────────────────
@@ -1890,7 +1895,9 @@ def main():
     am.add_argument("--identityfile",    default=None,
                     help="File of EAP identities (probed in order)")
     am.add_argument("--cleartext",       action="store_true",
-                    help="Only test cleartext (non-TLS) auth methods")
+                    help="Only test methods where credentials are sent in plaintext "
+                         "within the tunnel (PAP, GTC, OTP) — these are interceptable "
+                         "verbatim via evil twin attacks")
     am.add_argument("-o", "--output",    default=None, help="Output directory")
 
     # ── deauth ────────────────────────────────────────────────────────────────
@@ -1901,6 +1908,8 @@ def main():
     da.add_argument("--bssid",           default=None, help="Target BSSID (skip scan if provided)")
     da.add_argument("-c", "--channel",   type=int, default=None,
                     help="Channel (required when --bssid is used)")
+    da.add_argument("-s", "--scan-time", type=int, default=15, dest="scan_time",
+                    help="Seconds to scan for the AP's BSSID (default: 15)")
 
     args = ap.parse_args()
 
@@ -1914,7 +1923,8 @@ def main():
 
     if args.mode == "userenum":
         hunter = EAPHunter(essid=args.essid, iface=args.interface,
-                           out_dir=out_dir, capture_time=args.capture)
+                           out_dir=out_dir, capture_time=args.capture,
+                           scan_time=args.scan_time)
 
         def _sig(_s, _f):
             hunter._cleanup(); sys.exit(0)
@@ -1973,7 +1983,8 @@ def main():
             die("--channel required when --bssid is specified")
 
         da = Deauther(essid=args.essid, bssid=args.bssid,
-                      channel=args.channel, iface=args.interface)
+                      channel=args.channel, iface=args.interface,
+                      scan_time=args.scan_time)
         signal.signal(signal.SIGINT,  lambda _s, _f: sys.exit(0))
         signal.signal(signal.SIGTERM, lambda _s, _f: sys.exit(0))
         da.run()
