@@ -807,6 +807,18 @@ class EAPHunter:
                 if line.lower() in ("q", "quit", "exit"):
                     break
 
+                # ── BSSID reselect ────────────────────────────────────────
+                if line.lower() == "b":
+                    stop_sniff.set()
+                    sniff_thread.join(timeout=SNIFF_SLICE + 1)
+                    stop_sniff.clear()
+                    with self._client_lock:
+                        self._client_table.clear()
+                    self._discover_ap()
+                    sniff_thread = threading.Thread(target=sniff_loop, daemon=True)
+                    sniff_thread.start()
+                    continue
+
                 with self._client_lock:
                     clients = _sorted_clients(self._client_table)
 
@@ -960,8 +972,8 @@ class EAPHunter:
             print(row)
 
         n_clients = len(clients)
-        prompt = f"  [?] Select [1-{n_clients}], 'auto', or 'q': " if n_clients else \
-                 "  [?] Waiting for clients … ('q' to quit): "
+        prompt = f"  [?] Select [1-{n_clients}], 'auto', 'b' (BSSID), 'q': " if n_clients else \
+                 "  [?] Waiting for clients … ('b' BSSID, 'q' quit): "
         print(prompt, end="", flush=True)
 
         return len(rows)
@@ -1782,8 +1794,8 @@ class Deauther:
         for row in rows:
             print(row)
         n = len(clients)
-        prompt = (f"  [?] Select [1-{n}], 'auto', or 'q': " if n
-                  else "  [?] Waiting for clients … ('q' to quit): ")
+        prompt = (f"  [?] Select [1-{n}], 'auto', 'b' (BSSID), 'q': " if n
+                  else "  [?] Waiting for clients … ('b' BSSID, 'q' quit): ")
         print(prompt, end="", flush=True)
         return len(rows)
 
@@ -1828,6 +1840,18 @@ class Deauther:
 
                 if line.lower() in ("q", "quit", "exit"):
                     break
+
+                # ── BSSID reselect ────────────────────────────────────────
+                if line.lower() == "b":
+                    stop_sniff.set()
+                    sniff_thread.join(timeout=SNIFF_SLICE + 1)
+                    stop_sniff.clear()
+                    with self._client_lock:
+                        self._client_table.clear()
+                    self._discover_ap()
+                    sniff_thread = threading.Thread(target=sniff_loop, daemon=True)
+                    sniff_thread.start()
+                    continue
 
                 with self._client_lock:
                     clients = _sorted_clients(self._client_table)
