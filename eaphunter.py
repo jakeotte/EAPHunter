@@ -964,7 +964,7 @@ class EAPHunter:
                  "  [?] Waiting for clients … ('q' to quit): "
         print(prompt, end="", flush=True)
 
-        return len(rows) + 1   # +1 for the prompt line
+        return len(rows)
 
     # ── Deauth + Capture (sniff starts BEFORE deauth is sent) ────────────────
 
@@ -1785,7 +1785,7 @@ class Deauther:
         prompt = (f"  [?] Select [1-{n}], 'auto', or 'q': " if n
                   else "  [?] Waiting for clients … ('q' to quit): ")
         print(prompt, end="", flush=True)
-        return len(rows) + 1
+        return len(rows)
 
     # ── Deauth ───────────────────────────────────────────────────────────────
 
