@@ -49,6 +49,28 @@ EAP_METHODS = {
     26: "MS-CHAPv2", 43: "EAP-FAST", 50: "EAP-PWD",
 }
 
+# Expanded type map used by analyze mode (passive sniff — no active probing)
+ANALYZE_EAP_METHODS = {
+    1:   "Identity",
+    3:   "NAK",
+    4:   "EAP-MD5",
+    6:   "EAP-OTP",
+    13:  "EAP-TLS",
+    17:  "LEAP",
+    18:  "EAP-SIM",
+    21:  "EAP-TTLS",
+    23:  "EAP-AKA",
+    25:  "EAP-PEAP",
+    26:  "EAP-MSCHAPv2",
+    29:  "EAP-MSCHAP",
+    32:  "EAP-IKEv2",
+    43:  "EAP-FAST",
+    50:  "EAP-PWD",
+    52:  "EAP-EKE",
+    55:  "EAP-AKA'",
+    254: "EAP-Expanded",
+}
+
 CHANNELS = list(range(1, 14)) + [
     36, 40, 44, 48, 52, 56, 60, 64,
     100, 104, 108, 112, 149, 153, 157, 161, 165,
@@ -1574,6 +1596,266 @@ class EAPSprayer:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class EAPAnalyzer:
+    """
+    Passive EAP protocol analyzer.
+
+    Channel-hops across all bands sniffing Beacon and EAPOL/EAP frames.
+    Builds a live table of every SSID/BSSID where 802.1X traffic is seen
+    and reports which EAP methods the RADIUS servers are advertising.
+    No deauth, no active probing — read-only.
+    """
+
+    def __init__(self, iface: str, out_dir: str, duration: int = 0):
+        _require_scapy()
+        self.iface    = iface
+        self.out_dir  = Path(out_dir)
+        self.duration = duration   # 0 = run until Ctrl+C / SIGINT
+
+        self._lock          = threading.Lock()
+        self._bssid_ssid:    dict[str, str]      = {}
+        self._bssid_channel: dict[str, int]      = {}
+        self._findings:      dict[str, set[str]] = {}  # bssid → EAP method names
+        self._eapol_count:   dict[str, int]      = {}  # bssid → raw EAPOL frame count
+        self._stop          = threading.Event()
+
+    # ── Public entry point ────────────────────────────────────────────────────
+
+    def run(self):
+        section("EAP Analyze Mode  —  Passive Protocol Survey")
+        info("Sniffing all channels for 802.1X/EAPOL traffic …")
+        info("Ctrl+C or SIGTERM to stop and print the summary.\n")
+        self._enable_monitor()
+        try:
+            self._analyze()
+        finally:
+            self._restore_managed()
+
+    # ── Monitor mode helpers ──────────────────────────────────────────────────
+
+    def _enable_monitor(self):
+        section("Monitor Mode")
+        info("Killing interfering processes …")
+        _kill_interfering()
+        info(f"Setting {self.iface} to monitor mode …")
+        for cmd in (
+            ["ip", "link", "set", self.iface, "down"],
+            ["iw", "dev",  self.iface, "set", "type", "monitor"],
+            ["ip", "link", "set", self.iface, "up"],
+        ):
+            r = subprocess.run(cmd, capture_output=True)
+            if r.returncode != 0:
+                die(f"Command failed: {' '.join(cmd)}\n{r.stderr.decode()}")
+        ok(f"Monitor mode active on {self.iface}")
+
+    def _restore_managed(self):
+        for cmd in (
+            ["ip", "link", "set", self.iface, "down"],
+            ["iw", "dev",  self.iface, "set", "type", "managed"],
+            ["ip", "link", "set", self.iface, "up"],
+        ):
+            subprocess.run(cmd, capture_output=True)
+
+    def _hop_channels(self, stop: threading.Event, current: dict):
+        while not stop.is_set():
+            for ch in CHANNELS:
+                if stop.is_set():
+                    return
+                r = subprocess.run(["iw", "dev", self.iface, "set", "channel", str(ch)],
+                                   capture_output=True)
+                if r.returncode == 0:
+                    current["ch"] = ch
+                time.sleep(0.25)
+
+    # ── Core sniff + display loop ─────────────────────────────────────────────
+
+    def _analyze(self):
+        current_ch = {"ch": 1}
+        stop_hop   = threading.Event()
+        stop_sniff = threading.Event()
+
+        hop_thread = threading.Thread(
+            target=self._hop_channels, args=(stop_hop, current_ch), daemon=True
+        )
+        hop_thread.start()
+
+        def sniff_loop():
+            while not stop_sniff.is_set():
+                _sc.sniff(iface=self.iface, prn=self._handle_frame,
+                          timeout=SNIFF_SLICE, store=False)
+
+        sniff_thread = threading.Thread(target=sniff_loop, daemon=True)
+        sniff_thread.start()
+
+        start      = time.time()
+        prev_lines = 0
+        try:
+            while not self._stop.is_set():
+                if self.duration and (time.time() - start) >= self.duration:
+                    break
+                if prev_lines:
+                    print(f"\033[{prev_lines}A\r\033[J", end="", flush=True)
+                prev_lines = self._print_table(current_ch)
+                time.sleep(3)
+        finally:
+            stop_sniff.set()
+            stop_hop.set()
+            sniff_thread.join(timeout=SNIFF_SLICE + 1)
+
+        self._print_report()
+
+    # ── Packet handler ────────────────────────────────────────────────────────
+
+    def _handle_frame(self, pkt):
+        if not pkt.haslayer(_sc.Dot11):
+            return
+
+        # Beacon / ProbeResp → build BSSID→SSID map
+        if pkt.haslayer(_sc.Dot11Beacon) or pkt.haslayer(_sc.Dot11ProbeResp):
+            bssid = pkt[_sc.Dot11].addr3 or pkt[_sc.Dot11].addr2
+            if not bssid:
+                return
+            bssid        = bssid.lower()
+            essid_bytes  = b""
+            ds_ch        = 0
+            elt = pkt[_sc.Dot11Elt] if pkt.haslayer(_sc.Dot11Elt) else None
+            while isinstance(elt, _sc.Dot11Elt):
+                if elt.ID == 0:
+                    essid_bytes = elt.info
+                elif elt.ID == 3 and elt.info:
+                    ds_ch = elt.info[0]
+                elt = elt.payload
+            try:
+                essid = essid_bytes.decode(errors="replace")
+            except Exception:
+                return
+            with self._lock:
+                self._bssid_ssid.setdefault(bssid, essid or f"<hidden:{bssid[:8]}>")
+                if ds_ch:
+                    self._bssid_channel[bssid] = ds_ch
+            return
+
+        # Only data frames carry EAPOL/EAP
+        dot11 = pkt[_sc.Dot11]
+        if dot11.type != 2:
+            return
+
+        fc      = int(dot11.FCfield)
+        to_ds   = bool(fc & 0x01)
+        from_ds = bool(fc & 0x02)
+        if to_ds and not from_ds:        # client → AP
+            bssid = dot11.addr1
+        elif from_ds and not to_ds:      # AP → client
+            bssid = dot11.addr2
+        else:
+            return
+
+        if not bssid:
+            return
+        bssid = bssid.lower()
+
+        # Count every EAPOL frame so we know the network is doing 802.1X
+        if pkt.haslayer(_sc.EAPOL):
+            with self._lock:
+                self._eapol_count[bssid] = self._eapol_count.get(bssid, 0) + 1
+
+        if not pkt.haslayer(_sc.EAP):
+            return
+
+        eap = pkt[_sc.EAP]
+
+        # EAP-Request (code=1): server proposing a specific method
+        if eap.code == 1 and eap.type not in (0, 1):
+            method = ANALYZE_EAP_METHODS.get(eap.type, f"type-{eap.type}")
+            with self._lock:
+                self._findings.setdefault(bssid, set()).add(method)
+
+        # EAP-NAK (code=2, type=3): client listing methods it will accept
+        elif eap.code == 2 and eap.type == 3:
+            try:
+                for t in bytes(eap.payload):
+                    if t not in (0, 3):
+                        name = ANALYZE_EAP_METHODS.get(t, f"type-{t}")
+                        with self._lock:
+                            self._findings.setdefault(bssid, set()).add(f"NAK→{name}")
+            except Exception:
+                pass
+
+    # ── Live table ────────────────────────────────────────────────────────────
+
+    def _print_table(self, current_ch: dict) -> int:
+        ts = time.strftime("%H:%M:%S")
+        with self._lock:
+            findings     = {k: set(v) for k, v in self._findings.items()}
+            eapol_count  = dict(self._eapol_count)
+            bssid_ssid   = dict(self._bssid_ssid)
+            bssid_channel = dict(self._bssid_channel)
+
+        bar  = "=" * 78
+        rows = ["", f"  {bar}",
+                f"  EAPHunter Analyze  |  ch {current_ch['ch']:>3}  |  {ts}",
+                f"  {bar}"]
+
+        active = sorted(eapol_count, key=lambda b: -eapol_count[b])
+        if not active:
+            rows.append("  [*] No EAPOL frames seen yet — keep scanning …")
+        else:
+            rows.append(
+                f"  {'SSID':<30}  {'BSSID':<17}  {'CH':>3}  {'EAPOL':>5}  EAP METHODS"
+            )
+            rows.append(f"  {'─'*30}  {'─'*17}  {'─'*3}  {'─'*5}  {'─'*32}")
+            for bssid in active:
+                ssid    = bssid_ssid.get(bssid, "<unknown>")[:30]
+                ch      = bssid_channel.get(bssid, "?")
+                cnt     = eapol_count[bssid]
+                methods = ", ".join(sorted(findings.get(bssid, set()))) or "(probing…)"
+                rows.append(
+                    f"  {ssid:<30}  {bssid:<17}  {str(ch):>3}  {cnt:>5}  {methods}"
+                )
+
+        rows.append("")
+        for row in rows:
+            print(row)
+        return len(rows)
+
+    # ── Final report ──────────────────────────────────────────────────────────
+
+    def _print_report(self):
+        section("EAP Analysis Report")
+        with self._lock:
+            findings      = {k: sorted(v) for k, v in self._findings.items()}
+            eapol_count   = dict(self._eapol_count)
+            bssid_ssid    = dict(self._bssid_ssid)
+            bssid_channel = dict(self._bssid_channel)
+
+        if not eapol_count:
+            warn("No EAPOL frames captured during the session.")
+            return
+
+        tsv_rows = ["SSID\tBSSID\tChannel\tEAPOL_Frames\tEAP_Methods"]
+        for bssid in sorted(eapol_count, key=lambda b: -eapol_count[b]):
+            ssid    = bssid_ssid.get(bssid, "<unknown>")
+            ch      = bssid_channel.get(bssid, "?")
+            cnt     = eapol_count[bssid]
+            methods = findings.get(bssid, [])
+
+            ok(f"{ssid}  ({bssid})  ch {ch}  —  {cnt} EAPOL frame(s)")
+            if methods:
+                for m in methods:
+                    print(f"           EAP: {m}")
+            else:
+                warn("         No EAP method frames decoded (only EAPOL framing observed)")
+            tsv_rows.append(f"{ssid}\t{bssid}\t{ch}\t{cnt}\t{', '.join(methods)}")
+
+        report_file = self.out_dir / "analyze_report.tsv"
+        try:
+            report_file.write_text("\n".join(tsv_rows) + "\n")
+            ok(f"\nReport saved → {report_file}")
+        except Exception as e:
+            warn(f"Could not write report: {e}")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class Deauther:
     """
     Continuous client monitor + targeted deauth. No EAP capture.
@@ -1940,6 +2222,15 @@ def main():
                          "verbatim via evil twin attacks")
     am.add_argument("-o", "--output",    default=None, help="Output directory")
 
+    # ── analyze ───────────────────────────────────────────────────────────────
+    az = sub.add_parser("analyze",
+                        help="Passively monitor all SSIDs for EAPOL handshakes "
+                             "and identify EAP methods in use")
+    az.add_argument("-i", "--interface", required=True, help="Wireless interface")
+    az.add_argument("-t", "--time",      type=int, default=0, dest="duration",
+                    help="Stop after N seconds and print report (default: 0 = until Ctrl+C)")
+    az.add_argument("-o", "--output",    default=None, help="Output directory")
+
     # ── deauth ────────────────────────────────────────────────────────────────
     da = sub.add_parser("deauth",
                         help="Monitor clients and deauthenticate on demand")
@@ -2015,6 +2306,16 @@ def main():
                 cleartext_only=args.cleartext,
             )
             prober.run()
+
+    elif args.mode == "analyze":
+        analyzer = EAPAnalyzer(iface=args.interface, out_dir=out_dir,
+                               duration=args.duration)
+
+        def _sig_az(_s, _f):
+            analyzer._stop.set()
+        signal.signal(signal.SIGINT,  _sig_az)
+        signal.signal(signal.SIGTERM, _sig_az)
+        analyzer.run()
 
     elif args.mode == "deauth":
         if not args.essid and not args.bssid:
