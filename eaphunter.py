@@ -2249,7 +2249,7 @@ def main():
     sp.add_argument("-o", "--output",    default=None, help="Output directory")
 
     # ── authmethods ───────────────────────────────────────────────────────────
-    am = sub.add_parser("authmethods",
+    am = sub.add_parser("checkuser",
                         help="Probe which EAP auth methods the RADIUS server supports")
     am.add_argument("-e", "--essid",     required=True, help="Target SSID")
     am.add_argument("-i", "--interface", required=True, help="Wireless interface")
@@ -2264,7 +2264,7 @@ def main():
     am.add_argument("-o", "--output",    default=None, help="Output directory")
 
     # ── analyze ───────────────────────────────────────────────────────────────
-    az = sub.add_parser("analyze",
+    az = sub.add_parser("authmethods",
                         help="Passively monitor a WPA-Enterprise AP for EAPOL "
                              "handshakes and identify EAP methods in use")
     az.add_argument("-e", "--essid",     required=True, help="Target SSID")
@@ -2332,7 +2332,7 @@ def main():
         signal.signal(signal.SIGTERM, lambda _s, _f: sys.exit(0))
         sprayer.run()
 
-    elif args.mode == "authmethods":
+    elif args.mode == "checkuser":
         identities: list[str] = []
         if args.identity:
             identities.append(args.identity)
@@ -2351,7 +2351,7 @@ def main():
             )
             prober.run()
 
-    elif args.mode == "analyze":
+    elif args.mode == "authmethods":
         analyzer = EAPAnalyzer(essid=args.essid, iface=args.interface,
                                out_dir=out_dir, scan_time=args.scan_time,
                                duration=args.duration)

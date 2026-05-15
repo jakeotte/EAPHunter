@@ -23,12 +23,12 @@ Output: `eap_identities.txt` · `eap_server_cert.der/pem` · `eap_handshake_<mac
 
 ---
 
-## analyze
+## authmethods
 
 Passively sniffs EAPOL handshakes on a target AP. Reports observed EAP methods.
 
 ```
-sudo python3 eaphunter.py analyze -e <SSID> -i <iface> [-s <secs>] [-t <secs>] [-o <dir>]
+sudo python3 eaphunter.py authmethods -e <SSID> -i <iface> [-s <secs>] [-t <secs>] [-o <dir>]
 ```
 
 `-t` stops after N seconds. Default runs until Ctrl+C.
@@ -36,12 +36,12 @@ Output: `analyze_report.tsv`
 
 ---
 
-## authmethods
+## checkuser
 
 Actively probes which EAP methods a RADIUS server accepts for a given identity.
 
 ```
-sudo python3 eaphunter.py authmethods -e <SSID> -i <iface> -I <identity> [--cleartext] [-o <dir>]
+sudo python3 eaphunter.py checkuser -e <SSID> -i <iface> -I <identity> [--cleartext] [-o <dir>]
 ```
 
 `--cleartext` limits probing to PAP/GTC/OTP (plaintext-in-tunnel, evil-twin interceptable).
