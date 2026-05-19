@@ -71,3 +71,18 @@ Monitors clients on a target AP and sends deauth frames on demand. No EAP captur
 sudo python3 eaphunter.py deauth -e <SSID> -i <iface>
 sudo python3 eaphunter.py deauth --bssid <BSSID> -c <channel> -i <iface>
 ```
+
+---
+
+## psk-pmkid
+
+Injects auth + association from a spoofed STA against a WPA2-PSK AP. Extracts PMKID from EAPOL-Key M1 and emits a hashcat `-m 22000` hash line.
+
+```
+sudo python3 eaphunter.py psk-pmkid -e <SSID> -i <iface> [-t <secs>] [-d] [-o <dir>]
+sudo python3 eaphunter.py psk-pmkid --bssid <BSSID> -c <channel> -i <iface>
+```
+
+`-d` broadcasts deauth to force real clients to re-associate (passive capture fallback).
+`--sta-mac` overrides the random locally-administered MAC used for association.
+Output: `pmkid_hash.22000` — crack with `hashcat -m 22000 pmkid_hash.22000 <wordlist>`
